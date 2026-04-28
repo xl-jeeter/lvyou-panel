@@ -97,6 +97,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Lawnet Device Panel", version="1.0", lifespan=lifespan)
 
+# ── Background SMS Polling ─────────────────────────────────────
+async def sms_polling_loop():
+    """Periodically poll all devices for new SMS."""
+    await asyncio.sleep(30)  # Wait for device init
+    while True:
+        try:
+            db = await get_db()
+            cur = await db.execute("SELECT id, ip, token FROM devices")
+            devices = [dict(r) for r in (await cur.fetchall())]
+            await db.close()
+            for dev in devices:
+                try:
+                    await poll_sms(dev["id"], dev["ip"], dev["token"])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(60)  # Poll every 60 seconds
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    asyncio.create_task(sms_polling_loop())
+    yield
+
 # Serve static files
 import os
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
