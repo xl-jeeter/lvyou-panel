@@ -319,11 +319,15 @@ async def api_all_status():
     rows = await cur.fetchall()
     await db.close()
 
-    results = []
-    for row in rows:
-        dev = dict(row)
-        res = await device_call(dev["ip"], dev["token"], "stat", timeout=8)
-        results.append({"device": dev, "status": res})
+    async def fetch_status(dev):
+        try:
+            res = await device_call(dev["ip"], dev["token"], "stat", timeout=5)
+        except Exception:
+            res = {"code": -1, "note": "offline"}
+        return {"device": dict(dev), "status": res}
+
+    tasks = [fetch_status(dict(r)) for r in rows]
+    results = await asyncio.gather(*tasks)
     return results
 
 
@@ -738,15 +742,16 @@ function signalBars(dbm) {
 
 // ══════════ Dashboard ══════════════════════════════════════════
 async function refreshAll() {
-  const btn = document.getElementById('refreshBtn');
-  btn.disabled = true; btn.textContent = '⟳ 刷新中...';
+  const grid = document.getElementById('deviceGrid');
+  grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--sub)"><span class="spin"></span> 加载中...</div>';
   try {
     const r = await fetch(API+'/devices/status/all');
     const data = await r.json();
     renderDevices(data);
     document.getElementById('lastRefresh').textContent = new Date().toLocaleTimeString();
-  } catch(e) { toast('刷新失败', false); }
-  btn.disabled = false; btn.textContent = '🔄 刷新';
+  } catch(e) {
+    grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger)">加载失败，请重试</div>';
+  }
 }
 
 function renderDevices(data) {
