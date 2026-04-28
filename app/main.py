@@ -321,7 +321,7 @@ async def api_all_status():
 
     async def fetch_status(dev):
         try:
-            res = await device_call(dev["ip"], dev["token"], "stat", timeout=5)
+            res = await device_call(dev["ip"], dev["token"], "stat", timeout=3)
         except Exception:
             res = {"code": -1, "note": "offline"}
         return {"device": dict(dev), "status": res}
@@ -745,12 +745,15 @@ async function refreshAll() {
   const grid = document.getElementById('deviceGrid');
   grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--sub)"><span class="spin"></span> 加载中...</div>';
   try {
-    const r = await fetch(API+'/devices/status/all');
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch(API+'/devices/status/all', {signal: ctrl.signal});
+    clearTimeout(timeout);
     const data = await r.json();
     renderDevices(data);
     document.getElementById('lastRefresh').textContent = new Date().toLocaleTimeString();
   } catch(e) {
-    grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger)">加载失败，请重试</div>';
+    grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger)">加载失败，<a href="javascript:refreshAll()" style="color:var(--c)">点击重试</a></div>';
   }
 }
 
