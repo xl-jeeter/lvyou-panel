@@ -79,6 +79,8 @@ async def poll_sms(device_id: str, ip: str, token: str):
                     (device_id, f"sim{slot_num}", phone, content, direction,
                      json.dumps(msg, ensure_ascii=False), sms_time, sms_ts)
                 )
+                # Notify via Feishu (do NOT await - fire and forget)
+                asyncio.create_task(notify_new_sms(device_id, f"sim{slot_num}", phone, content, direction))
             await db.commit()
     except Exception as e:
         import traceback
@@ -128,6 +130,32 @@ import os
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+
+# ── Feishu Notification ─────────────────────────────────────────
+async def send_feishu(msg: str):
+    """Send notification to configured Feishu webhook."""
+    db = await get_db()
+    cur = await db.execute("SELECT value FROM config WHERE key='feishu_webhook'")
+    row = await cur.fetchone()
+    await db.close()
+    if not row or not row[0]:
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {"msg_type": "text", "content": {"text": msg}}
+            async with session.post(row[0], json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                return resp.status == 200
+    except Exception:
+        return False
+
+
+async def notify_new_sms(dev_name: str, slot: str, phone: str, content: str, direction: str):
+    """Push SMS notification via Feishu."""
+    emoji = "📩" if direction == "received" else "📤"
+    dir_label = "收到" if direction == "received" else "发出"
+    msg = f"{emoji} {dev_name} {dir_label}短信\n卡槽：{slot}\n号码：{phone}\n内容：{content}"
+    await send_feishu(msg)
 
 
 # ── HTML Pages ──────────────────────────────────────────────────
@@ -278,6 +306,8 @@ async def api_webhook(request: Request):
         )
         await db.commit()
         await db.close()
+        # Feishu notify
+        asyncio.create_task(notify_new_sms(dev_id, slot, phone, content, "received"))
 
     elif msg_type == 502:  # Sent SMS success
         slot = f"sim{data.get('slot', 1)}"
@@ -294,6 +324,8 @@ async def api_webhook(request: Request):
         )
         await db.commit()
         await db.close()
+        # Feishu notify
+        asyncio.create_task(notify_new_sms(dev_id, slot, phone, content, "sent"))
 
     return {"status": "ok"}
 
@@ -357,7 +389,12 @@ async def api_device_cmd(device_id: str, cmd: str, data: dict = None):
                 (device_id, f"sim{slot_num}", phone, content, "sent")
             )
             await db2.commit()
+            # Get device name for notification
+            cur = await db2.execute("SELECT name FROM devices WHERE id=?", (device_id,))
+            dev_row = await cur.fetchone()
+            dev_name = dev_row[0] if dev_row else device_id
             await db2.close()
+            asyncio.create_task(notify_new_sms(dev_name, f"sim{slot_num}", phone, content, "sent"))
         return res
 
     # Generic command
@@ -431,6 +468,26 @@ async def api_refresh_sms(device_id: str):
 
     dev = dict(row)
     await poll_sms(device_id, dev["ip"], dev["token"])
+    return {"ok": True}
+
+
+# ── API: Settings ──────────────────────────────────────────────
+@app.get("/api/settings")
+async def api_get_settings():
+    db = await get_db()
+    cur = await db.execute("SELECT key, value FROM config")
+    rows = await cur.fetchall()
+    await db.close()
+    return {r["key"]: r["value"] for r in rows}
+
+
+@app.post("/api/settings")
+async def api_save_settings(data: dict):
+    db = await get_db()
+    for key, value in data.items():
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+    await db.commit()
+    await db.close()
     return {"ok": True}
 
 
@@ -640,6 +697,18 @@ HTML = r"""<!DOCTYPE html>
     <button class="btn btn-sm" onclick="refreshAll()" id="refreshBtn">🔄 刷新</button>
   </div>
   <div class="stats-grid" id="statsCards"></div>
+  <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,#f0fdf4,#ecfdf5);border-color:var(--c)">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2 style="margin:0">🔔 飞书推送设置</h2>
+      <span id="feishuStatus" style="font-size:12px;color:var(--sub)"></span>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+      <input id="feishuWebhook" placeholder="飞书机器人 Webhook 地址" style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px">
+      <button class="btn btn-p btn-sm" onclick="saveFeishu()">保存</button>
+      <button class="btn btn-sm" onclick="testFeishu()">测试</button>
+    </div>
+    <div style="font-size:11px;color:var(--sub);margin-top:6px">新短信到达时自动推送到飞书群。在飞书群设置 → 群机器人 → 添加 Webhook 机器人获取地址</div>
+  </div>
   <div class="card" style="margin-bottom:16px" id="quickAddCard">
     <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="document.getElementById('quickAddForm').classList.toggle('mr')">
       <h2 style="margin:0">➕ 快速添加设备</h2><span style="color:var(--sub);font-size:12px">展开/收起</span>
@@ -743,17 +812,28 @@ function signalBars(dbm) {
 // ══════════ Dashboard ══════════════════════════════════════════
 async function refreshAll() {
   const grid = document.getElementById('deviceGrid');
-  grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--sub)"><span class="spin"></span> 加载中...</div>';
+  // Show cached view immediately, then update
+  if (window._devCache) {
+    renderDevices(window._devCache);
+    document.getElementById('lastRefresh').textContent = (new Date()).toLocaleTimeString() + ' (缓存)';
+  } else {
+    grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--sub)"><span class="spin"></span> 加载中...</div>';
+  }
   try {
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), 8000);
+    const timeout = setTimeout(() => ctrl.abort(), 6000);
     const r = await fetch(API+'/devices/status/all', {signal: ctrl.signal});
     clearTimeout(timeout);
     const data = await r.json();
+    window._devCache = data;
     renderDevices(data);
     document.getElementById('lastRefresh').textContent = new Date().toLocaleTimeString();
   } catch(e) {
-    grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger)">加载失败，<a href="javascript:refreshAll()" style="color:var(--c)">点击重试</a></div>';
+    if (window._devCache) {
+      document.getElementById('lastRefresh').textContent = new Date().toLocaleTimeString() + ' (刷新失败，显示缓存)';
+    } else {
+      grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger)">加载失败，<a href="javascript:refreshAll()" style="color:var(--c)">点击重试</a></div>';
+    }
   }
 }
 
@@ -1119,9 +1199,41 @@ function getCurrentPage() {
   return 'dashboard';
 }
 
+// ── Feishu Settings ────────────────────────────────────────────
+async function loadFeishuSettings() {
+  try {
+    const r = await fetch(API+'/settings');
+    const d = await r.json();
+    if (d.feishu_webhook) {
+      document.getElementById('feishuWebhook').value = d.feishu_webhook;
+      document.getElementById('feishuStatus').innerHTML = '<span style="color:var(--c)">✅ 已配置</span>';
+    }
+  } catch(e) {}
+}
+
+async function saveFeishu() {
+  const url = document.getElementById('feishuWebhook').value.trim();
+  if (!url) { toast('请输入 Webhook 地址', false); return; }
+  try {
+    await fetch(API+'/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feishu_webhook:url})});
+    document.getElementById('feishuStatus').innerHTML = '<span style="color:var(--c)">✅ 已配置</span>';
+    toast('已保存');
+  } catch(e) { toast('保存失败', false); }
+}
+
+async function testFeishu() {
+  const url = document.getElementById('feishuWebhook').value.trim();
+  if (!url) { toast('请先输入 Webhook 地址', false); return; }
+  try {
+    const r = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg_type:'text',content:{text:'✅ LvYou Panel 飞书推送测试成功！'}})});
+    if (r.ok) toast('测试消息已发送，请查看飞书群');
+    else toast('发送失败: '+r.status, false);
+  } catch(e) { toast('连接失败', false); }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const p = getCurrentPage();
-  if (p === 'dashboard') refreshAll();
+  if (p === 'dashboard') { loadFeishuSettings(); refreshAll(); }
   else if (p === 'sms') { loadDevices(); loadSMS(); }
   else if (p === 'logs') { loadDevices(); loadLogs(); }
   else if (p === 'devices') loadDevices();

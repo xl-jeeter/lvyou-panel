@@ -64,6 +64,11 @@ async def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_call_device ON call_logs(device_id);
         CREATE INDEX IF NOT EXISTS idx_call_time ON call_logs(call_time DESC);
+
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        );
     """)
     # Migration: add sms_ts column if missing (for older DBs)
     try:
