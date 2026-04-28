@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  panel:
+    build: .
+    container_name: device-panel
+    restart: unless-stopped
+    ports:
+      - "34567:34567"
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
