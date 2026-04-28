@@ -132,30 +132,45 @@ if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 
-# ── Feishu Notification ─────────────────────────────────────────
-async def send_feishu(msg: str):
-    """Send notification to configured Feishu webhook."""
+# ── DingTalk Notification ───────────────────────────────────────
+import hashlib
+import hmac
+import base64
+import urllib.parse
+
+async def send_dingtalk(msg: str):
+    """Send notification to configured DingTalk webhook with signature."""
     db = await get_db()
-    cur = await db.execute("SELECT value FROM config WHERE key='feishu_webhook'")
+    cur = await db.execute("SELECT value FROM config WHERE key='dingtalk_webhook'")
     row = await cur.fetchone()
+    cur2 = await db.execute("SELECT value FROM config WHERE key='dingtalk_secret'")
+    row2 = await cur2.fetchone()
     await db.close()
     if not row or not row[0]:
         return False
+    webhook_url = row[0]
+    secret = row2[0] if row2 else ""
     try:
+        if secret:
+            timestamp = str(round(time.time() * 1000))
+            sign_string = f"{timestamp}\n{secret}"
+            hmac_code = hmac.new(secret.encode("utf-8"), sign_string.encode("utf-8"), digestmod=hashlib.sha256).digest()
+            sign = urllib.parse.quote(base64.b64encode(hmac_code))
+            webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
         async with aiohttp.ClientSession() as session:
-            payload = {"msg_type": "text", "content": {"text": msg}}
-            async with session.post(row[0], json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            payload = {"msgtype": "text", "text": {"content": msg}}
+            async with session.post(webhook_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 return resp.status == 200
     except Exception:
         return False
 
 
 async def notify_new_sms(dev_name: str, slot: str, phone: str, content: str, direction: str):
-    """Push SMS notification via Feishu."""
+    """Push SMS notification via DingTalk."""
     emoji = "📩" if direction == "received" else "📤"
     dir_label = "收到" if direction == "received" else "发出"
     msg = f"{emoji} {dev_name} {dir_label}短信\n卡槽：{slot}\n号码：{phone}\n内容：{content}"
-    await send_feishu(msg)
+    await send_dingtalk(msg)
 
 
 # ── HTML Pages ──────────────────────────────────────────────────
@@ -491,6 +506,35 @@ async def api_save_settings(data: dict):
     return {"ok": True}
 
 
+@app.post("/api/test-dingtalk")
+async def api_test_dingtalk():
+    """Test DingTalk webhook via backend proxy (avoids CORS)."""
+    db = await get_db()
+    cur = await db.execute("SELECT value FROM config WHERE key='dingtalk_webhook'")
+    row = await cur.fetchone()
+    cur2 = await db.execute("SELECT value FROM config WHERE key='dingtalk_secret'")
+    row2 = await cur2.fetchone()
+    await db.close()
+    if not row or not row[0]:
+        raise HTTPException(400, "未配置钉钉 Webhook")
+    webhook_url = row[0]
+    secret = row2[0] if row2 else ""
+    try:
+        if secret:
+            timestamp = str(round(time.time() * 1000))
+            sign_string = f"{timestamp}\n{secret}"
+            hmac_code = hmac.new(secret.encode(), sign_string.encode(), digestmod=hashlib.sha256).digest()
+            sign = urllib.parse.quote(base64.b64encode(hmac_code))
+            webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
+        async with aiohttp.ClientSession() as session:
+            payload = {"msgtype": "text", "text": {"content": "✅ LvYou Panel 钉钉推送测试成功！"}}
+            async with session.post(webhook_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                result = await resp.text()
+                return {"ok": resp.status == 200, "status": resp.status, "body": result}
+    except Exception as e:
+        return {"ok": False, "status": 0, "body": str(e)}
+
+
 # ── API: Summary Stats ──────────────────────────────────────────
 @app.get("/api/stats")
 async def api_stats():
@@ -697,30 +741,33 @@ HTML = r"""<!DOCTYPE html>
     <button class="btn btn-sm" onclick="refreshAll()" id="refreshBtn">🔄 刷新</button>
   </div>
   <div class="stats-grid" id="statsCards"></div>
-  <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,#f0fdf4,#ecfdf5);border-color:var(--c)">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <h2 style="margin:0">🔔 飞书推送设置</h2>
-      <span id="feishuStatus" style="font-size:12px;color:var(--sub)"></span>
+  <div class="card" style="margin-bottom:16px;overflow:hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="document.getElementById('settingsBody').classList.toggle('mr');var s=document.getElementById('settingsBody').classList.contains('mr')?'▶ 展开设置':'▼ 收起设置';document.getElementById('settingsHint').textContent=s">
+      <h2 style="margin:0">⚙️ 设置 <span id="dingtalkStatus" style="font-size:11px;font-weight:400"></span></h2>
+      <span style="font-size:11px;color:var(--sub)" id="settingsHint">▶ 展开设置</span>
     </div>
-    <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
-      <input id="feishuWebhook" placeholder="飞书机器人 Webhook 地址" style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px">
-      <button class="btn btn-p btn-sm" onclick="saveFeishu()">保存</button>
-      <button class="btn btn-sm" onclick="testFeishu()">测试</button>
-    </div>
-    <div style="font-size:11px;color:var(--sub);margin-top:6px">新短信到达时自动推送到飞书群。在飞书群设置 → 群机器人 → 添加 Webhook 机器人获取地址</div>
-  </div>
-  <div class="card" style="margin-bottom:16px" id="quickAddCard">
-    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="document.getElementById('quickAddForm').classList.toggle('mr')">
-      <h2 style="margin:0">➕ 快速添加设备</h2><span style="color:var(--sub);font-size:12px">展开/收起</span>
-    </div>
-    <form id="quickAddForm" class="mr" onsubmit="quickAddDevice(event)" style="margin-top:12px">
-      <div class="form-row">
-        <div class="form-group"><label>名称</label><input id="qaName" placeholder="可选，如：客厅路由器"></div>
-        <div class="form-group"><label>IP 地址 *</label><input id="qaIP" placeholder="192.168.x.x" required></div>
-        <div class="form-group"><label>管理员密码 *</label><input id="qaPwd" type="password" placeholder="管理员密码" required></div>
+    <div id="settingsBody" class="mr" style="margin-top:10px">
+      <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+        <div style="font-size:13px;font-weight:600;margin-bottom:5px">🔔 钉钉推送</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <input id="dingtalkWebhook" placeholder="Webhook 地址" style="flex:2;min-width:160px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+          <input id="dingtalkSecret" placeholder="加签密钥(可选)" style="flex:1;min-width:120px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+          <button class="btn btn-p btn-sm" onclick="saveDingtalk()">保存</button>
+          <button class="btn btn-sm" onclick="testDingtalk()">测试</button>
+        </div>
       </div>
-      <button class="btn btn-p" type="submit">+ 添加设备</button>
-    </form>
+      <div>
+        <div style="font-size:13px;font-weight:600;margin-bottom:5px">➕ 添加设备</div>
+        <form onsubmit="quickAddDevice(event)">
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <input id="qaName" placeholder="名称" style="flex:1;min-width:80px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+            <input id="qaIP" placeholder="IP *" required style="flex:1;min-width:100px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+            <input id="qaPwd" type="password" placeholder="密码 *" required style="flex:1;min-width:80px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+            <button class="btn btn-p btn-sm" type="submit">添加</button>
+          </div>
+        </form>
+      </div>
+    </div>
   </div>
   <div class="device-grid" id="deviceGrid"></div>
 </div>
@@ -1175,7 +1222,6 @@ async function quickAddDevice(e) {
     document.getElementById('qaName').value = '';
     document.getElementById('qaIP').value = '';
     document.getElementById('qaPwd').value = '';
-    document.getElementById('quickAddForm').classList.add('mr');
     refreshAll();
     loadDevices();
   } catch(e) { toast('请求失败', false); }
@@ -1199,41 +1245,49 @@ function getCurrentPage() {
   return 'dashboard';
 }
 
-// ── Feishu Settings ────────────────────────────────────────────
-async function loadFeishuSettings() {
+// ── DingTalk Settings ──────────────────────────────────────────
+async function loadDingtalkSettings() {
   try {
     const r = await fetch(API+'/settings');
     const d = await r.json();
-    if (d.feishu_webhook) {
-      document.getElementById('feishuWebhook').value = d.feishu_webhook;
-      document.getElementById('feishuStatus').innerHTML = '<span style="color:var(--c)">✅ 已配置</span>';
+    if (d.dingtalk_webhook) {
+      document.getElementById('dingtalkWebhook').value = d.dingtalk_webhook;
+    }
+    if (d.dingtalk_secret) {
+      document.getElementById('dingtalkSecret').value = d.dingtalk_secret;
+    }
+    const st = document.getElementById('dingtalkStatus');
+    if (d.dingtalk_webhook) {
+      st.innerHTML = '<span style="color:var(--c)"> · 钉钉已配置</span>';
     }
   } catch(e) {}
 }
 
-async function saveFeishu() {
-  const url = document.getElementById('feishuWebhook').value.trim();
+async function saveDingtalk() {
+  const url = document.getElementById('dingtalkWebhook').value.trim();
+  const secret = document.getElementById('dingtalkSecret').value.trim();
   if (!url) { toast('请输入 Webhook 地址', false); return; }
   try {
-    await fetch(API+'/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feishu_webhook:url})});
-    document.getElementById('feishuStatus').innerHTML = '<span style="color:var(--c)">✅ 已配置</span>';
+    await fetch(API+'/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dingtalk_webhook:url, dingtalk_secret:secret})});
+    document.getElementById('dingtalkStatus').innerHTML = '<span style="color:var(--c)"> · 钉钉已配置</span>';
     toast('已保存');
   } catch(e) { toast('保存失败', false); }
 }
 
-async function testFeishu() {
-  const url = document.getElementById('feishuWebhook').value.trim();
-  if (!url) { toast('请先输入 Webhook 地址', false); return; }
+async function testDingtalk() {
+  const url = document.getElementById('dingtalkWebhook').value.trim();
+  if (!url) { toast('请先输入并保存 Webhook 地址', false); return; }
   try {
-    const r = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg_type:'text',content:{text:'✅ LvYou Panel 飞书推送测试成功！'}})});
-    if (r.ok) toast('测试消息已发送，请查看飞书群');
-    else toast('发送失败: '+r.status, false);
-  } catch(e) { toast('连接失败', false); }
+    const r = await fetch(API+'/test-dingtalk', {method:'POST'});
+    const d = await r.json();
+    if (d.ok) toast('✅ 测试成功！请查看钉钉群');
+    else toast('发送失败: ' + (d.body||d.status), false);
+  } catch(e) { toast('请求失败', false); }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   const p = getCurrentPage();
-  if (p === 'dashboard') { loadFeishuSettings(); refreshAll(); }
+  if (p === 'dashboard') { loadDingtalkSettings(); refreshAll(); }
   else if (p === 'sms') { loadDevices(); loadSMS(); }
   else if (p === 'logs') { loadDevices(); loadLogs(); }
   else if (p === 'devices') loadDevices();
