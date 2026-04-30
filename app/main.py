@@ -141,6 +141,56 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Lawnet Device Panel", version="1.0", lifespan=lifespan)
 
+
+# ── API Key Auth Middleware ─────────────────────────────────────
+async def _get_api_key():
+    """Read stored API key from config."""
+    try:
+        async with db_connection() as db:
+            cur = await db.execute("SELECT value FROM config WHERE key='api_key'")
+            row = await cur.fetchone()
+        return row["value"] if row else ""
+    except Exception:
+        return ""
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Protect /api/* endpoints with X-API-Key header."""
+    path = request.url.path
+    # Skip auth for: static files, HTML pages, webhook, auth endpoint
+    if (
+        not path.startswith("/api/")
+        or path == "/api/auth"
+        or path == "/webhook"
+        or path.startswith("/static/")
+    ):
+        return await call_next(request)
+
+    stored_key = await _get_api_key()
+    # If no API key is configured, skip auth (initial setup)
+    if not stored_key:
+        return await call_next(request)
+
+    provided = request.headers.get("X-API-Key", "")
+    if not provided:
+        provided = request.query_params.get("api_key", "")
+    if provided != stored_key:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+@app.post("/api/auth")
+async def api_auth(data: dict):
+    """Validate API key. Returns {ok: true} if valid."""
+    stored_key = await _get_api_key()
+    if not stored_key:
+        return {"ok": True, "needsSetup": True}
+    provided = data.get("api_key", "")
+    if provided != stored_key:
+        raise HTTPException(401, "Invalid API key")
+    return {"ok": True}
+
 # Serve static files
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(_static_dir):
@@ -629,6 +679,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <input id="dingtalkSecret" placeholder="加签密钥(可选)" style="flex:1;min-width:120px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
           <button class="btn btn-p btn-sm" onclick="saveDingtalk()">保存</button>
           <button class="btn btn-sm" onclick="testDingtalk()">测试</button>
+        </div>
+      </div>
+      <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+        <div style="font-size:13px;font-weight:600;margin-bottom:5px">🔑 API 密钥</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <input id="apiKeyInput" type="password" placeholder="留空则关闭认证" style="flex:2;min-width:160px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:12px">
+          <button class="btn btn-p btn-sm" onclick="saveApiKey()">保存</button>
+          <span id="apiKeyStatus" style="font-size:11px;color:var(--sub)"></span>
         </div>
       </div>
       <div>

@@ -1,5 +1,59 @@
 const API = '/api';
 let smsPage = 1, logPage = 1;
+let _apiKey = localStorage.getItem('api_key') || '';
+
+// ── API Key helpers ───────────────────────────────────────────
+function apiHeaders(extra) {
+  const h = {'Content-Type':'application/json', ...extra};
+  if (_apiKey) h['X-API-Key'] = _apiKey;
+  return h;
+}
+async function apiFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = apiHeaders(opts.headers);
+  const r = await fetch(url, opts);
+  if (r.status === 401) {
+    localStorage.removeItem('api_key');
+    _apiKey = '';
+    showLoginPage();
+    throw new Error('Unauthorized');
+  }
+  return r;
+}
+
+// ── Login page ────────────────────────────────────────────────
+function showLoginPage() {
+  document.querySelector('main').innerHTML = `
+    <div style="max-width:400px;margin:80px auto;text-align:center">
+      <h2 style="margin-bottom:24px">🔐 需要登录</h2>
+      <form onsubmit="doLogin(event)">
+        <div class="form-group" style="margin-bottom:16px">
+          <input id="loginKey" type="password" placeholder="输入 API 密钥" required autofocus style="text-align:center;font-size:16px;padding:12px">
+        </div>
+        <button class="btn btn-p" type="submit" style="padding:10px 32px;font-size:15px">登录</button>
+      </form>
+    </div>`;
+}
+async function doLogin(e) {
+  e.preventDefault();
+  const key = document.getElementById('loginKey').value.trim();
+  if (!key) return;
+  try {
+    const r = await apiFetch(API+'/auth', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:key})
+    });
+    if (r.ok) {
+      _apiKey = key;
+      localStorage.setItem('api_key', key);
+      toast('登录成功');
+      initPage();
+    } else {
+      toast('密钥错误', false);
+    }
+  } catch(err) { toast('连接失败', false); }
+}
 
 // ── Nav highlight ─────────────────────────────────────────────
 (function(){
@@ -39,7 +93,7 @@ async function refreshAll() {
   try {
     const ctrl = new AbortController();
     const timeout = setTimeout(() => ctrl.abort(), 6000);
-    const r = await fetch(API+'/devices/status/all', {signal: ctrl.signal});
+    const r = await apiFetch(API+'/devices/status/all', {signal: ctrl.signal});
     clearTimeout(timeout);
     const data = await r.json();
     window._devCache = data;
@@ -129,7 +183,7 @@ function editName(e, devId, oldName) {
     const newName = input.value.trim();
     if (newName && newName !== oldName) {
       try {
-        await fetch(API+'/devices/'+devId, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:newName})});
+        await apiFetch(API+'/devices/'+devId, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:newName})});
         toast('改名成功');
       } catch(e) { toast('改名失败',false); }
     }
@@ -146,7 +200,7 @@ async function checkSmsStore(dev) {
   const el = document.getElementById('sms-store-'+dev.id);
   if (!el) return;
   try {
-    const r = await fetch(API+'/devices/'+dev.id+'/cmd/storesmsen', {method:'POST'});
+    const r = await apiFetch(API+'/devices/'+dev.id+'/cmd/storesmsen', {method:'POST'});
     const d = await r.json();
     if (d.code===0 && d.val) {
       const parts = d.val.split(';');
@@ -161,11 +215,11 @@ async function checkSmsStore(dev) {
 async function toggleSmsStore(devId) {
   if (!confirm('切换短信存储后需要重启设备才能生效。继续？')) return;
   try {
-    const r1 = await fetch(API+'/devices/'+devId+'/cmd/storesmsen', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({p1:'0',p2:'on'})});
+    const r1 = await apiFetch(API+'/devices/'+devId+'/cmd/storesmsen', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({p1:'0',p2:'on'})});
     const d1 = await r1.json();
     if (d1.code!==0) { toast('设置失败: '+(d1.note||''), false); return; }
     toast('已开启，正在重启设备...');
-    await fetch(API+'/devices/'+devId+'/cmd/restart', {method:'POST'});
+    await apiFetch(API+'/devices/'+devId+'/cmd/restart', {method:'POST'});
     setTimeout(refreshAll, 10000);
   } catch(e) { toast('操作失败', false); }
 }
@@ -175,7 +229,7 @@ async function cmdAction(devId, cmd, confirmMsg, params) {
   if (confirmMsg && !confirm(confirmMsg)) return;
   try {
     const opts = params ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params)} : {method:'POST'};
-    const r = await fetch(API+'/devices/'+devId+'/cmd/'+cmd, opts);
+    const r = await apiFetch(API+'/devices/'+devId+'/cmd/'+cmd, opts);
     const d = await r.json();
     toast(d.code===0 ? '执行成功' : '失败: '+(d.note||''), d.code===0);
     if (d.code===0) setTimeout(refreshAll, 1000);
@@ -184,7 +238,7 @@ async function cmdAction(devId, cmd, confirmMsg, params) {
 
 async function toggleNet(devId, slot) {
   try {
-    const r = await fetch(API+'/devices/'+devId+'/status');
+    const r = await apiFetch(API+'/devices/'+devId+'/status');
     const d = await r.json();
     const s = d.status || {};
     const simNet = s.simNet || [false, false];
@@ -198,7 +252,7 @@ async function toggleNet(devId, slot) {
 
 async function refreshSMS(devId) {
   try {
-    const r = await fetch(API+'/sms/refresh/'+devId, {method:'POST'});
+    const r = await apiFetch(API+'/sms/refresh/'+devId, {method:'POST'});
     const d = await r.json();
     toast('同步完成', d.ok);
   } catch(e) { toast('同步失败', false); }
@@ -267,7 +321,7 @@ async function loadSMS(pg) {
   if (dir) params.set('direction', dir);
 
   try {
-    const r = await fetch(API+'/sms?'+params);
+    const r = await apiFetch(API+'/sms?'+params);
     const d = await r.json();
     let html = '';
     d.items.forEach(m => {
@@ -294,7 +348,7 @@ async function loadLogs(pg) {
   if (phone) params.set('phone', phone);
 
   try {
-    const r = await fetch(API+'/logs?'+params);
+    const r = await apiFetch(API+'/logs?'+params);
     const d = await r.json();
     let html = '';
     d.items.forEach(l => {
@@ -325,7 +379,7 @@ function renderPagination(type, total, page, pp) {
 // ══════════ Device Management ══════════════════════════════════
 async function loadDevices() {
   try {
-    const r = await fetch(API+'/devices');
+    const r = await apiFetch(API+'/devices');
     const data = await r.json();
     let html = '';
     if (data.length === 0) html = '<tr><td colspan="6" style="text-align:center;color:var(--sub)">暂无设备，请添加</td></tr>';
@@ -358,7 +412,7 @@ async function addDevice(e) {
   const ip = document.getElementById('addIP').value.trim();
   const pwd = document.getElementById('addPwd').value.trim();
   try {
-    const r = await fetch(API+'/devices', {
+    const r = await apiFetch(API+'/devices', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({name, ip, password: pwd})
@@ -378,7 +432,7 @@ async function quickAddDevice(e) {
   const ip = document.getElementById('qaIP').value.trim();
   const pwd = document.getElementById('qaPwd').value.trim();
   try {
-    const r = await fetch(API+'/devices', {
+    const r = await apiFetch(API+'/devices', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({name, ip, password: pwd})
@@ -396,7 +450,7 @@ async function quickAddDevice(e) {
 async function delDevice(id) {
   if (!confirm('确定删除该设备？短信和通话记录也将被删除。')) return;
   try {
-    await fetch(API+'/devices/'+id, {method:'DELETE'});
+    await apiFetch(API+'/devices/'+id, {method:'DELETE'});
     toast('已删除');
     loadDevices();
   } catch(e) { toast('删除失败', false); }
@@ -414,7 +468,7 @@ function getCurrentPage() {
 // ── DingTalk Settings ──────────────────────────────────────────
 async function loadDingtalkSettings() {
   try {
-    const r = await fetch(API+'/settings');
+    const r = await apiFetch(API+'/settings');
     const d = await r.json();
     if (d.dingtalk_webhook) {
       document.getElementById('dingtalkWebhook').value = d.dingtalk_webhook;
@@ -426,6 +480,15 @@ async function loadDingtalkSettings() {
     if (d.dingtalk_webhook) {
       st.innerHTML = '<span style="color:var(--c)"> · 钉钉已配置</span>';
     }
+    // Load API key status
+    const apiSt = document.getElementById('apiKeyStatus');
+    if (apiSt) {
+      if (d.api_key) {
+        apiSt.innerHTML = '<span style="color:var(--c)">已启用</span>';
+      } else {
+        apiSt.innerHTML = '<span style="color:var(--sub)">未启用</span>';
+      }
+    }
   } catch(e) {}
 }
 
@@ -434,7 +497,7 @@ async function saveDingtalk() {
   const secret = document.getElementById('dingtalkSecret').value.trim();
   if (!url) { toast('请输入 Webhook 地址', false); return; }
   try {
-    await fetch(API+'/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dingtalk_webhook:url, dingtalk_secret:secret})});
+    await apiFetch(API+'/settings', {method:'POST',headers:apiHeaders(),body:JSON.stringify({dingtalk_webhook:url, dingtalk_secret:secret})});
     document.getElementById('dingtalkStatus').innerHTML = '<span style="color:var(--c)"> · 钉钉已配置</span>';
     toast('已保存');
   } catch(e) { toast('保存失败', false); }
@@ -444,17 +507,52 @@ async function testDingtalk() {
   const url = document.getElementById('dingtalkWebhook').value.trim();
   if (!url) { toast('请先输入并保存 Webhook 地址', false); return; }
   try {
-    const r = await fetch(API+'/test-dingtalk', {method:'POST'});
+    const r = await apiFetch(API+'/test-dingtalk', {method:'POST'});
     const d = await r.json();
     if (d.ok) toast('✅ 测试成功！请查看钉钉群');
     else toast('发送失败: ' + (d.body||d.status), false);
   } catch(e) { toast('请求失败', false); }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+// ── API Key Settings ──────────────────────────────────────────
+async function saveApiKey() {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  try {
+    await apiFetch(API+'/settings', {method:'POST',headers:apiHeaders(),body:JSON.stringify({api_key:key})});
+    if (key) {
+      _apiKey = key;
+      localStorage.setItem('api_key', key);
+      document.getElementById('apiKeyStatus').innerHTML = '<span style="color:var(--c)">已启用</span>';
+      toast('API 密钥已保存');
+    } else {
+      _apiKey = '';
+      localStorage.removeItem('api_key');
+      document.getElementById('apiKeyStatus').innerHTML = '<span style="color:var(--sub)">已关闭</span>';
+      toast('API 认证已关闭');
+    }
+  } catch(e) { toast('保存失败', false); }
+}
+
+async function initPage() {
+  // Check if API key is needed
+  try {
+    const r = await fetch(API+'/auth', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:_apiKey})
+    });
+    if (r.status === 401) { showLoginPage(); return; }
+    const d = await r.json();
+    if (d.needsSetup) {
+      // No API key configured yet, proceed without auth
+    }
+  } catch(e) { /* server might be down */ }
+
   const p = getCurrentPage();
   if (p === 'dashboard') { loadDingtalkSettings(); refreshAll(); }
   else if (p === 'sms') { loadDevices(); loadSMS(); }
   else if (p === 'logs') { loadDevices(); loadLogs(); }
   else if (p === 'devices') loadDevices();
-});
+}
+
+document.addEventListener('DOMContentLoaded', initPage);
