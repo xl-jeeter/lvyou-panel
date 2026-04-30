@@ -345,6 +345,9 @@ async def api_update_device(device_id: str, data: dict):
 
 
 # ── API: Webhook ────────────────────────────────────────────────
+# TODO: Add HMAC signature verification when device firmware supports it.
+# For now, webhook is auth-free (devices push directly).
+# Optional: set 'webhook_ips' in config to whitelist specific device IPs.
 @app.post("/webhook")
 async def api_webhook(request: Request):
     """Receive push messages from devices (SMS, call, etc.)"""
