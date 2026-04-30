@@ -2,22 +2,62 @@
 
 import asyncio
 import hashlib
+import hmac
+import base64
 import json
+import logging
+import os
 import time
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
-
-import aiohttp
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from urllib.parse import parse_qsl
 
-from app.database import init_db, get_db
+import aiohttp
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.database import init_db, get_db, db_connection
+
+# ── Logging ────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("lvyou-panel")
+
+# ── Timezone ───────────────────────────────────────────────────
+CST = timezone(timedelta(hours=8))
+
+# ── Global aiohttp session (reuse connections) ─────────────────
+_http_session: aiohttp.ClientSession | None = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+            connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300),
+        )
+    return _http_session
 
 # ── Token calc ──────────────────────────────────────────────────
 def calc_token(password: str) -> str:
     return hashlib.md5(f"admin|{password}".encode()).hexdigest()
+
+
+# ── DingTalk signing (shared logic) ─────────────────────────────
+def _sign_dingtalk_webhook(webhook_url: str, secret: str) -> str:
+    """Add timestamp + HMAC signature to DingTalk webhook URL."""
+    if not secret:
+        return webhook_url
+    timestamp = str(round(time.time() * 1000))
+    sign_string = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(secret.encode("utf-8"), sign_string.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    sign = urllib.parse.quote(base64.b64encode(hmac_code))
+    return f"{webhook_url}&timestamp={timestamp}&sign={sign}"
 
 
 # ── Device communication ────────────────────────────────────────
@@ -28,9 +68,9 @@ async def device_call(ip: str, token: str, cmd: str, params: dict = None, timeou
     if params:
         req_params.update(params)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=req_params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                return await resp.json()
+        session = await get_http_session()
+        async with session.get(url, params=req_params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            return await resp.json()
     except asyncio.TimeoutError:
         return {"code": -1, "note": "Timeout"}
     except aiohttp.ClientError as e:
@@ -39,76 +79,83 @@ async def device_call(ip: str, token: str, cmd: str, params: dict = None, timeou
         return {"code": -1, "note": str(e)}
 
 
-def translate_slot(slot: str) -> str:
-    return "sim1" if slot in ("1", "sim1") else "sim2"
-
-
 # ── SMS polling & caching ────────────────────────────────────────
 async def poll_sms(device_id: str, ip: str, token: str):
     """Fetch new SMS from device and cache locally."""
-    db = await get_db()
     try:
-        for slot_num in ("1", "2"):
-            slot_name = f"sim{slot_num}"
-            res = await device_call(ip, token, "querysms", {"p1": "0", "p2": "50", "p4": slot_num})
-            if res.get("code") != 0:
-                continue
-            
-            results = res.get("results", [])
-            if not isinstance(results, list) or len(results) == 0:
-                continue
-
-            cur = await db.execute(
-                "SELECT MAX(sms_ts) FROM sms WHERE device_id=? AND sim_slot=?",
-                (device_id, f"sim{slot_num}")
-            )
-            row = await cur.fetchone()
-            last_ts = (row[0] or 0)
-
-            for msg in results:
-                sms_ts = msg.get("smsTs", 0)
-                if sms_ts <= last_ts:
+        async with db_connection() as db:
+            for slot_num in ("1", "2"):
+                res = await device_call(ip, token, "querysms", {"p1": "0", "p2": "50", "p4": slot_num})
+                if res.get("code") != 0:
                     continue
-                direction = "sent" if msg.get("dir") == 1 else "received"
-                phone = msg.get("phNum", "")
-                content = msg.get("smsBd", "")
-                sms_time = datetime.utcfromtimestamp(sms_ts + 8*3600).strftime("%Y-%m-%d %H:%M:%S")
-                await db.execute(
-                    """INSERT INTO sms (device_id, sim_slot, phone, content, direction, raw_json, sms_time, sms_ts)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (device_id, f"sim{slot_num}", phone, content, direction,
-                     json.dumps(msg, ensure_ascii=False), sms_time, sms_ts)
+
+                results = res.get("results", [])
+                if not isinstance(results, list) or len(results) == 0:
+                    continue
+
+                cur = await db.execute(
+                    "SELECT MAX(sms_ts) FROM sms WHERE device_id=? AND sim_slot=?",
+                    (device_id, f"sim{slot_num}")
                 )
-                # Notify via Feishu (do NOT await - fire and forget)
-                asyncio.create_task(notify_new_sms(device_id, f"sim{slot_num}", phone, content, direction))
-            await db.commit()
+                row = await cur.fetchone()
+                last_ts = (row[0] or 0)
+
+                for msg in results:
+                    sms_ts = msg.get("smsTs", 0)
+                    if sms_ts <= last_ts:
+                        continue
+                    direction = "sent" if msg.get("dir") == 1 else "received"
+                    phone = msg.get("phNum", "")
+                    content = msg.get("smsBd", "")
+                    sms_time = datetime.fromtimestamp(sms_ts, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
+                    await db.execute(
+                        """INSERT INTO sms (device_id, sim_slot, phone, content, direction, raw_json, sms_time, sms_ts)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (device_id, f"sim{slot_num}", phone, content, direction,
+                         json.dumps(msg, ensure_ascii=False), sms_time, sms_ts)
+                    )
+                    # Get device name for notification
+                    cur = await db.execute("SELECT name FROM devices WHERE id=?", (device_id,))
+                    dev_row = await cur.fetchone()
+                    dev_name = dev_row["name"] if dev_row else device_id
+                    asyncio.create_task(notify_new_sms(dev_name, f"sim{slot_num}", phone, content, direction))
+                await db.commit()
     except Exception as e:
-        import traceback
-        print(f"poll_sms error for {device_id}: {e}")
-        traceback.print_exc()
-    finally:
-        await db.close()
+        logger.error("poll_sms error for %s: %s", device_id, e, exc_info=True)
 
 
 # ── Lifespan ────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    asyncio.create_task(sms_polling_loop())
+    logger.info("LvYou Panel started")
     yield
+    # Cleanup: close global HTTP session
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        _http_session = None
+    logger.info("LvYou Panel stopped")
 
 
 app = FastAPI(title="Lawnet Device Panel", version="1.0", lifespan=lifespan)
 
-# ── Background SMS Polling ─────────────────────────────────────
+# Serve static files
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+
+# ── SMS Polling Loop ───────────────────────────────────────────
 async def sms_polling_loop():
     """Periodically poll all devices for new SMS."""
     await asyncio.sleep(30)  # Wait for device init
     while True:
         try:
-            db = await get_db()
-            cur = await db.execute("SELECT id, ip, token FROM devices")
-            devices = [dict(r) for r in (await cur.fetchall())]
-            await db.close()
+            async with db_connection() as db:
+                cur = await db.execute("SELECT id, ip, token FROM devices")
+                devices = [dict(r) for r in (await cur.fetchall())]
             for dev in devices:
                 try:
                     await poll_sms(dev["id"], dev["ip"], dev["token"])
@@ -119,48 +166,29 @@ async def sms_polling_loop():
         await asyncio.sleep(60)  # Poll every 60 seconds
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()
-    asyncio.create_task(sms_polling_loop())
-    yield
-
-# Serve static files
-import os
-_static_dir = os.path.join(os.path.dirname(__file__), "static")
-if os.path.isdir(_static_dir):
-    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
-
-
 # ── DingTalk Notification ───────────────────────────────────────
-import hashlib
-import hmac
-import base64
-import urllib.parse
-
 async def send_dingtalk(msg: str):
     """Send notification to configured DingTalk webhook with signature."""
-    db = await get_db()
-    cur = await db.execute("SELECT value FROM config WHERE key='dingtalk_webhook'")
-    row = await cur.fetchone()
-    cur2 = await db.execute("SELECT value FROM config WHERE key='dingtalk_secret'")
-    row2 = await cur2.fetchone()
-    await db.close()
-    if not row or not row[0]:
-        return False
-    webhook_url = row[0]
-    secret = row2[0] if row2 else ""
+    webhook_url = None
+    secret = None
     try:
-        if secret:
-            timestamp = str(round(time.time() * 1000))
-            sign_string = f"{timestamp}\n{secret}"
-            hmac_code = hmac.new(secret.encode("utf-8"), sign_string.encode("utf-8"), digestmod=hashlib.sha256).digest()
-            sign = urllib.parse.quote(base64.b64encode(hmac_code))
-            webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
-        async with aiohttp.ClientSession() as session:
-            payload = {"msgtype": "text", "text": {"content": msg}}
-            async with session.post(webhook_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                return resp.status == 200
+        async with db_connection() as db:
+            cur = await db.execute("SELECT value FROM config WHERE key='dingtalk_webhook'")
+            row = await cur.fetchone()
+            cur2 = await db.execute("SELECT value FROM config WHERE key='dingtalk_secret'")
+            row2 = await cur2.fetchone()
+        if not row or not row["value"]:
+            return False
+        webhook_url = row["value"]
+        secret = row2["value"] if row2 else ""
+    except Exception:
+        return False
+    try:
+        signed_url = _sign_dingtalk_webhook(webhook_url, secret)
+        session = await get_http_session()
+        payload = {"msgtype": "text", "text": {"content": msg}}
+        async with session.post(signed_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            return resp.status == 200
     except Exception:
         return False
 
@@ -216,10 +244,9 @@ def _page(page_id: str, title: str) -> str:
 # ── API: Devices ────────────────────────────────────────────────
 @app.get("/api/devices")
 async def api_devices():
-    db = await get_db()
-    cur = await db.execute("SELECT * FROM devices ORDER BY created_at DESC")
-    rows = await cur.fetchall()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("SELECT * FROM devices ORDER BY created_at DESC")
+        rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
 
@@ -247,45 +274,43 @@ async def api_add_device(data: dict):
     if not name:
         name = f"Device-{ip.split('.')[-1]}"
 
-    db = await get_db()
-    await db.execute(
-        "INSERT OR REPLACE INTO devices (id, name, ip, token, notes) VALUES (?,?,?,?,?)",
-        (dev_id, name, ip, token, notes)
-    )
-    await db.commit()
-    await db.close()
+    async with db_connection() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO devices (id, name, ip, token, notes) VALUES (?,?,?,?,?)",
+            (dev_id, name, ip, token, notes)
+        )
+        await db.commit()
     return {"ok": True, "dev_id": dev_id}
 
 
 @app.delete("/api/devices/{device_id}")
 async def api_delete_device(device_id: str):
-    db = await get_db()
-    await db.execute("DELETE FROM devices WHERE id=?", (device_id,))
-    await db.execute("DELETE FROM sms WHERE device_id=?", (device_id,))
-    await db.execute("DELETE FROM call_logs WHERE device_id=?", (device_id,))
-    await db.commit()
-    await db.close()
+    async with db_connection() as db:
+        await db.execute("DELETE FROM devices WHERE id=?", (device_id,))
+        await db.execute("DELETE FROM sms WHERE device_id=?", (device_id,))
+        await db.execute("DELETE FROM call_logs WHERE device_id=?", (device_id,))
+        await db.commit()
     return {"ok": True}
 
 
 @app.put("/api/devices/{device_id}")
 async def api_update_device(device_id: str, data: dict):
-    db = await get_db()
+    allowed = ("name", "ip", "token", "notes")
     sets = []
     vals = []
-    for k in ("name", "ip", "token", "notes"):
+    for k in allowed:
         if k in data:
             sets.append(f"{k}=?")
             vals.append(data[k])
     if sets:
         vals.append(device_id)
-        await db.execute(f"UPDATE devices SET {', '.join(sets)} WHERE id=?", vals)
-        await db.commit()
-    await db.close()
+        async with db_connection() as db:
+            await db.execute(f"UPDATE devices SET {', '.join(sets)} WHERE id=?", vals)
+            await db.commit()
     return {"ok": True}
 
 
-# ── API: Device Status ──────────────────────────────────────────
+# ── API: Webhook ────────────────────────────────────────────────
 @app.post("/webhook")
 async def api_webhook(request: Request):
     """Receive push messages from devices (SMS, call, etc.)"""
@@ -311,46 +336,49 @@ async def api_webhook(request: Request):
         sms_ts = int(data.get("smsTs", 0)) // 1000  # ms -> seconds
         if not sms_ts:
             sms_ts = int(data.get("msgTs", 0))
-        sms_time = datetime.utcfromtimestamp(sms_ts + 8*3600).strftime("%Y-%m-%d %H:%M:%S")
+        sms_time = datetime.fromtimestamp(sms_ts, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
 
-        db = await get_db()
-        await db.execute(
-            """INSERT OR IGNORE INTO sms (device_id, sim_slot, phone, content, direction, raw_json, sms_time, sms_ts)
-               VALUES (?, ?, ?, ?, 'received', ?, ?, ?)""",
-            (dev_id, slot, phone, content, json.dumps(data, ensure_ascii=False), sms_time, sms_ts)
-        )
-        await db.commit()
-        await db.close()
-        # Feishu notify
-        asyncio.create_task(notify_new_sms(dev_id, slot, phone, content, "received"))
+        async with db_connection() as db:
+            await db.execute(
+                """INSERT OR IGNORE INTO sms (device_id, sim_slot, phone, content, direction, raw_json, sms_time, sms_ts)
+                   VALUES (?, ?, ?, ?, 'received', ?, ?, ?)""",
+                (dev_id, slot, phone, content, json.dumps(data, ensure_ascii=False), sms_time, sms_ts)
+            )
+            await db.commit()
+            # Get device name for notification
+            cur = await db.execute("SELECT name FROM devices WHERE id=?", (dev_id,))
+            dev_row = await cur.fetchone()
+            dev_name = dev_row["name"] if dev_row else dev_id
+        asyncio.create_task(notify_new_sms(dev_name, slot, phone, content, "received"))
 
     elif msg_type == 502:  # Sent SMS success
         slot = f"sim{data.get('slot', 1)}"
         phone = data.get("phNum", "")
         content = data.get("smsBd", "")
         sms_ts = int(data.get("devSmsTs", data.get("msgTs", 0)))
-        sms_time = datetime.utcfromtimestamp(sms_ts + 8*3600).strftime("%Y-%m-%d %H:%M:%S")
+        sms_time = datetime.fromtimestamp(sms_ts, tz=CST).strftime("%Y-%m-%d %H:%M:%S")
 
-        db = await get_db()
-        await db.execute(
-            """INSERT OR IGNORE INTO sms (device_id, sim_slot, phone, content, direction, raw_json, sms_time, sms_ts)
-               VALUES (?, ?, ?, ?, 'sent', ?, ?, ?)""",
-            (dev_id, slot, phone, content, json.dumps(data, ensure_ascii=False), sms_time, sms_ts)
-        )
-        await db.commit()
-        await db.close()
-        # Feishu notify
-        asyncio.create_task(notify_new_sms(dev_id, slot, phone, content, "sent"))
+        async with db_connection() as db:
+            await db.execute(
+                """INSERT OR IGNORE INTO sms (device_id, sim_slot, phone, content, direction, raw_json, sms_time, sms_ts)
+                   VALUES (?, ?, ?, ?, 'sent', ?, ?, ?)""",
+                (dev_id, slot, phone, content, json.dumps(data, ensure_ascii=False), sms_time, sms_ts)
+            )
+            await db.commit()
+            cur = await db.execute("SELECT name FROM devices WHERE id=?", (dev_id,))
+            dev_row = await cur.fetchone()
+            dev_name = dev_row["name"] if dev_row else dev_id
+        asyncio.create_task(notify_new_sms(dev_name, slot, phone, content, "sent"))
 
     return {"status": "ok"}
 
 
+# ── API: Device Status ──────────────────────────────────────────
 @app.get("/api/devices/{device_id}/status")
 async def api_device_status(device_id: str):
-    db = await get_db()
-    cur = await db.execute("SELECT * FROM devices WHERE id=?", (device_id,))
-    row = await cur.fetchone()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("SELECT * FROM devices WHERE id=?", (device_id,))
+        row = await cur.fetchone()
     if not row:
         raise HTTPException(404, "设备不存在")
 
@@ -361,30 +389,28 @@ async def api_device_status(device_id: str):
 
 @app.get("/api/devices/status/all")
 async def api_all_status():
-    db = await get_db()
-    cur = await db.execute("SELECT * FROM devices ORDER BY name")
-    rows = await cur.fetchall()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("SELECT * FROM devices ORDER BY name")
+        rows = await cur.fetchall()
+        devices = [dict(r) for r in rows]
 
     async def fetch_status(dev):
         try:
             res = await device_call(dev["ip"], dev["token"], "stat", timeout=3)
         except Exception:
             res = {"code": -1, "note": "offline"}
-        return {"device": dict(dev), "status": res}
+        return {"device": dev, "status": res}
 
-    tasks = [fetch_status(dict(r)) for r in rows]
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*[fetch_status(d) for d in devices])
     return results
 
 
 # ── API: Commands ───────────────────────────────────────────────
 @app.post("/api/devices/{device_id}/cmd/{cmd}")
 async def api_device_cmd(device_id: str, cmd: str, data: dict = None):
-    db = await get_db()
-    cur = await db.execute("SELECT * FROM devices WHERE id=?", (device_id,))
-    row = await cur.fetchone()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("SELECT * FROM devices WHERE id=?", (device_id,))
+        row = await cur.fetchone()
     if not row:
         raise HTTPException(404, "设备不存在")
 
@@ -398,17 +424,15 @@ async def api_device_cmd(device_id: str, cmd: str, data: dict = None):
         content = params.get("p3", "")
         res = await device_call(dev["ip"], dev["token"], "sendsms", {"p1": slot_num, "p2": phone, "p3": content})
         if res.get("code") == 0:
-            db2 = await get_db()
-            await db2.execute(
-                "INSERT INTO sms (device_id, sim_slot, phone, content, direction, sms_time, sms_ts) VALUES (?,?,?,?,?,datetime('now','localtime'),strftime('%s','now'))",
-                (device_id, f"sim{slot_num}", phone, content, "sent")
-            )
-            await db2.commit()
-            # Get device name for notification
-            cur = await db2.execute("SELECT name FROM devices WHERE id=?", (device_id,))
-            dev_row = await cur.fetchone()
-            dev_name = dev_row[0] if dev_row else device_id
-            await db2.close()
+            async with db_connection() as db:
+                await db.execute(
+                    "INSERT INTO sms (device_id, sim_slot, phone, content, direction, sms_time, sms_ts) VALUES (?,?,?,?,?,datetime('now','localtime'),strftime('%s','now'))",
+                    (device_id, f"sim{slot_num}", phone, content, "sent")
+                )
+                await db.commit()
+                cur = await db.execute("SELECT name FROM devices WHERE id=?", (device_id,))
+                dev_row = await cur.fetchone()
+                dev_name = dev_row["name"] if dev_row else device_id
             asyncio.create_task(notify_new_sms(dev_name, f"sim{slot_num}", phone, content, "sent"))
         return res
 
@@ -427,41 +451,38 @@ async def api_sms(
     page: int = Query(1, ge=1),
     per_page: int = Query(30, ge=1, le=200),
 ):
-    db = await get_db()
     where = ["1=1"]
-    params = []
+    qparams = []
 
     if device_id:
         where.append("device_id=?")
-        params.append(device_id)
+        qparams.append(device_id)
     if phone:
         where.append("phone LIKE ?")
-        params.append(f"%{phone}%")
+        qparams.append(f"%{phone}%")
     if keyword:
         where.append("content LIKE ?")
-        params.append(f"%{keyword}%")
+        qparams.append(f"%{keyword}%")
     if direction:
         where.append("direction=?")
-        params.append(direction)
+        qparams.append(direction)
 
     where_sql = " AND ".join(where)
     offset = (page - 1) * per_page
 
-    cur = await db.execute(
-        f"SELECT COUNT(*) FROM sms WHERE {where_sql}", params
-    )
-    total = (await cur.fetchone())[0]
+    async with db_connection() as db:
+        cur = await db.execute(f"SELECT COUNT(*) FROM sms WHERE {where_sql}", qparams)
+        total = (await cur.fetchone())[0]
 
-    cur = await db.execute(
-        f"""SELECT s.*, d.name as device_name, d.ip as device_ip
-           FROM sms s LEFT JOIN devices d ON s.device_id=d.id
-           WHERE {where_sql}
-           ORDER BY s.sms_time DESC
-           LIMIT ? OFFSET ?""",
-        params + [per_page, offset]
-    )
-    rows = await cur.fetchall()
-    await db.close()
+        cur = await db.execute(
+            f"""SELECT s.*, d.name as device_name, d.ip as device_ip
+               FROM sms s LEFT JOIN devices d ON s.device_id=d.id
+               WHERE {where_sql}
+               ORDER BY s.sms_time DESC
+               LIMIT ? OFFSET ?""",
+            qparams + [per_page, offset]
+        )
+        rows = await cur.fetchall()
 
     return {
         "total": total,
@@ -474,10 +495,9 @@ async def api_sms(
 @app.post("/api/sms/refresh/{device_id}")
 async def api_refresh_sms(device_id: str):
     """Manually refresh SMS cache from device."""
-    db = await get_db()
-    cur = await db.execute("SELECT * FROM devices WHERE id=?", (device_id,))
-    row = await cur.fetchone()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("SELECT * FROM devices WHERE id=?", (device_id,))
+        row = await cur.fetchone()
     if not row:
         raise HTTPException(404, "设备不存在")
 
@@ -489,48 +509,42 @@ async def api_refresh_sms(device_id: str):
 # ── API: Settings ──────────────────────────────────────────────
 @app.get("/api/settings")
 async def api_get_settings():
-    db = await get_db()
-    cur = await db.execute("SELECT key, value FROM config")
-    rows = await cur.fetchall()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("SELECT key, value FROM config")
+        rows = await cur.fetchall()
     return {r["key"]: r["value"] for r in rows}
 
 
 @app.post("/api/settings")
 async def api_save_settings(data: dict):
-    db = await get_db()
-    for key, value in data.items():
-        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
-    await db.commit()
-    await db.close()
+    async with db_connection() as db:
+        for key, value in data.items():
+            await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+        await db.commit()
     return {"ok": True}
 
 
 @app.post("/api/test-dingtalk")
 async def api_test_dingtalk():
     """Test DingTalk webhook via backend proxy (avoids CORS)."""
-    db = await get_db()
-    cur = await db.execute("SELECT value FROM config WHERE key='dingtalk_webhook'")
-    row = await cur.fetchone()
-    cur2 = await db.execute("SELECT value FROM config WHERE key='dingtalk_secret'")
-    row2 = await cur2.fetchone()
-    await db.close()
-    if not row or not row[0]:
+    webhook_url = None
+    secret = None
+    async with db_connection() as db:
+        cur = await db.execute("SELECT value FROM config WHERE key='dingtalk_webhook'")
+        row = await cur.fetchone()
+        cur2 = await db.execute("SELECT value FROM config WHERE key='dingtalk_secret'")
+        row2 = await cur2.fetchone()
+    if not row or not row["value"]:
         raise HTTPException(400, "未配置钉钉 Webhook")
-    webhook_url = row[0]
-    secret = row2[0] if row2 else ""
+    webhook_url = row["value"]
+    secret = row2["value"] if row2 else ""
     try:
-        if secret:
-            timestamp = str(round(time.time() * 1000))
-            sign_string = f"{timestamp}\n{secret}"
-            hmac_code = hmac.new(secret.encode(), sign_string.encode(), digestmod=hashlib.sha256).digest()
-            sign = urllib.parse.quote(base64.b64encode(hmac_code))
-            webhook_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
-        async with aiohttp.ClientSession() as session:
-            payload = {"msgtype": "text", "text": {"content": "✅ LvYou Panel 钉钉推送测试成功！"}}
-            async with session.post(webhook_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                result = await resp.text()
-                return {"ok": resp.status == 200, "status": resp.status, "body": result}
+        signed_url = _sign_dingtalk_webhook(webhook_url, secret)
+        session = await get_http_session()
+        payload = {"msgtype": "text", "text": {"content": "✅ LvYou Panel 钉钉推送测试成功！"}}
+        async with session.post(signed_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            result = await resp.text()
+            return {"ok": resp.status == 200, "status": resp.status, "body": result}
     except Exception as e:
         return {"ok": False, "status": 0, "body": str(e)}
 
@@ -538,24 +552,22 @@ async def api_test_dingtalk():
 # ── API: Summary Stats ──────────────────────────────────────────
 @app.get("/api/stats")
 async def api_stats():
-    db = await get_db()
-    cur = await db.execute("SELECT COUNT(*) FROM devices")
-    device_count = (await cur.fetchone())[0]
-    cur = await db.execute("SELECT COUNT(*) FROM sms")
-    sms_total = (await cur.fetchone())[0]
-    cur = await db.execute("SELECT COUNT(*) FROM sms WHERE direction='received'")
-    sms_recv = (await cur.fetchone())[0]
-    cur = await db.execute("SELECT COUNT(*) FROM sms WHERE direction='sent'")
-    sms_sent = (await cur.fetchone())[0]
-    cur = await db.execute("SELECT COUNT(*) FROM call_logs")
-    call_total = (await cur.fetchone())[0]
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM devices),
+                (SELECT COUNT(*) FROM sms),
+                (SELECT COUNT(*) FROM sms WHERE direction='received'),
+                (SELECT COUNT(*) FROM sms WHERE direction='sent'),
+                (SELECT COUNT(*) FROM call_logs)
+        """)
+        row = await cur.fetchone()
     return {
-        "devices": device_count,
-        "sms_total": sms_total,
-        "sms_received": sms_recv,
-        "sms_sent": sms_sent,
-        "call_total": call_total,
+        "devices": row[0],
+        "sms_total": row[1],
+        "sms_received": row[2],
+        "sms_sent": row[3],
+        "call_total": row[4],
     }
 
 
@@ -567,29 +579,28 @@ async def api_logs(
     page: int = Query(1, ge=1),
     per_page: int = Query(30, ge=1, le=200),
 ):
-    db = await get_db()
     where = ["1=1"]
-    params = []
+    qparams = []
     if device_id:
         where.append("device_id=?")
-        params.append(device_id)
+        qparams.append(device_id)
     if phone:
         where.append("phone LIKE ?")
-        params.append(f"%{phone}%")
+        qparams.append(f"%{phone}%")
 
     where_sql = " AND ".join(where)
     offset = (page - 1) * per_page
 
-    cur = await db.execute(f"SELECT COUNT(*) FROM call_logs WHERE {where_sql}", params)
-    total = (await cur.fetchone())[0]
-    cur = await db.execute(
-        f"""SELECT c.*, d.name as device_name
-           FROM call_logs c LEFT JOIN devices d ON c.device_id=d.id
-           WHERE {where_sql} ORDER BY c.call_time DESC LIMIT ? OFFSET ?""",
-        params + [per_page, offset]
-    )
-    rows = await cur.fetchall()
-    await db.close()
+    async with db_connection() as db:
+        cur = await db.execute(f"SELECT COUNT(*) FROM call_logs WHERE {where_sql}", qparams)
+        total = (await cur.fetchone())[0]
+        cur = await db.execute(
+            f"""SELECT c.*, d.name as device_name
+               FROM call_logs c LEFT JOIN devices d ON c.device_id=d.id
+               WHERE {where_sql} ORDER BY c.call_time DESC LIMIT ? OFFSET ?""",
+            qparams + [per_page, offset]
+        )
+        rows = await cur.fetchall()
     return {"total": total, "page": page, "per_page": per_page, "items": [dict(r) for r in rows]}
 
 
