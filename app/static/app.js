@@ -325,18 +325,37 @@ async function loadSMS(pg) {
     const d = await r.json();
     let html = '';
     d.items.forEach(m => {
+      const content = m.content || '';
+      const truncated = content.length > 100 ? content.substring(0, 100) + '...' : content;
+      const needExpand = content.length > 100;
       html += `<tr>
         <td>${fmtTime(m.sms_time)}</td>
         <td>${esc(m.device_name||m.device_id)}</td>
         <td>${esc(m.sim_slot)}</td>
         <td><span class="badge ${m.direction==='received'?'badge-rec':'badge-sent'}">${m.direction==='received'?'接收':'发送'}</span></td>
         <td>${esc(m.phone)}</td>
-        <td class="content">${esc(m.content)}</td>
+        <td class="content" onclick="toggleSmsContent(this)" data-full="${esc(content)}" data-truncated="${esc(truncated)}">${esc(needExpand ? truncated : content)}</td>
       </tr>`;
     });
     document.getElementById('smsTableBody').innerHTML = html || '<tr><td colspan="6" style="text-align:center;color:var(--sub)">暂无记录</td></tr>';
     renderPagination('sms', d.total, d.page, d.per_page);
   } catch(e) { toast('加载失败', false); }
+}
+
+function toggleSmsContent(td) {
+  const full = td.getAttribute('data-full');
+  const truncated = td.getAttribute('data-truncated');
+  const isExpanded = td.textContent === full;
+  
+  if (isExpanded) {
+    td.textContent = truncated;
+    td.style.cursor = 'pointer';
+    td.title = '点击展开完整内容';
+  } else {
+    td.textContent = full;
+    td.style.cursor = 'default';
+    td.title = '点击收起内容';
+  }
 }
 
 async function loadLogs(pg) {
