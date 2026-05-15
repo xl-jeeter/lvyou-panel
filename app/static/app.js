@@ -329,11 +329,11 @@ async function loadSMS(pg) {
       const truncated = content.length > 100 ? content.substring(0, 100) + '...' : content;
       const needExpand = content.length > 100;
       html += `<tr>
-        <td>${fmtTime(m.sms_time)}</td>
-        <td>${esc(m.device_name||m.device_id)}</td>
-        <td>${esc(m.sim_slot)}</td>
-        <td><span class="badge ${m.direction==='received'?'badge-rec':'badge-sent'}">${m.direction==='received'?'接收':'发送'}</span></td>
-        <td>${esc(m.phone)}</td>
+        <td class="time">${fmtTime(m.sms_time)}</td>
+        <td class="device">${esc(m.device_name||m.device_id)}</td>
+        <td class="slot">${esc(m.sim_slot)}</td>
+        <td class="direction"><span class="badge ${m.direction==='received'?'badge-rec':'badge-sent'}">${m.direction==='received'?'接收':'发送'}</span></td>
+        <td class="phone">${esc(m.phone)}</td>
         <td class="content" onclick="toggleSmsContent(this)" data-full="${esc(content)}" data-truncated="${esc(truncated)}">${esc(needExpand ? truncated : content)}</td>
       </tr>`;
     });
