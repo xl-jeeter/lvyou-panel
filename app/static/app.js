@@ -161,10 +161,24 @@ function renderDevices(data) {
   });
 
   document.getElementById('deviceGrid').innerHTML = html;
+  data.forEach(d => { if (d.status&&d.status.code===0) checkSmsStore(d.device); });
+  // Fetch stats for additional cards
+  loadDashboardStats(online, offline);
+}
+
+async function loadDashboardStats(online, offline) {
+  let smsTotal = 0, callTotal = 0;
+  try {
+    const r = await apiFetch(API+'/stats');
+    const s = await r.json();
+    smsTotal = s.sms_total || 0;
+    callTotal = s.call_total || 0;
+  } catch(e) {}
   document.getElementById('statsCards').innerHTML =
     statCard(online, '在线设备', 'var(--c)') +
-    statCard(offline, '离线设备', 'var(--danger)');
-  data.forEach(d => { if (d.status&&d.status.code===0) checkSmsStore(d.device); });
+    statCard(offline, '离线设备', 'var(--danger)') +
+    statCard(smsTotal, '短信总数', '#3b82f6') +
+    statCard(callTotal, '通话总数', '#8b5cf6');
 }
 
 function statCard(num, label, color) {
