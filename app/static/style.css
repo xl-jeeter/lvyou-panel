@@ -52,6 +52,8 @@ main{max-width:1200px;margin:0 auto;padding:20px 24px}
 .tbl th{font-weight:600;color:var(--sub);font-size:12px;text-transform:uppercase;letter-spacing:.5px;background:var(--bg);position:sticky;top:0}
 .tbl td{white-space:nowrap}
 .tbl td.content{max-width:300px;white-space:normal;word-break:break-all}
+.tbl td.content[onclick]{cursor:pointer;transition:all .2s}
+.tbl td.content[onclick]:hover{background:#f0fdf4;outline:2px solid var(--c);outline-offset:-2px}
 .tbl tr:hover td{background:#f1f5f9}
 .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
 .badge-rec{background:#dcfce7;color:#166534}
@@ -111,4 +113,15 @@ main{max-width:1200px;margin:0 auto;padding:20px 24px}
   .device-card .foot .btn{flex:1;justify-content:center;padding:8px 6px;font-size:12px}
   .tbl{font-size:11px}
   .tbl th,.tbl td{padding:6px 4px}
+  /* 短信内容移动端优化 */
+  .tbl td.content{max-width:none;white-space:normal;word-break:break-word;line-height:1.4}
+  /* 短信表格响应式 */
+  .sms-table-container{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .sms-table{min-width:600px}
+  /* 搜索栏移动端优化 */
+  .search-bar{gap:6px}
+  .search-bar input,.search-bar select{padding:10px 12px;font-size:14px}
+  /* 分页移动端优化 */
+  .pg{gap:4px}
+  .pg button{padding:8px 12px;font-size:14px}
 }
