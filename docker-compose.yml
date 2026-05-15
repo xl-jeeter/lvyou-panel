@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   panel:
-    build: .
+    image: xilianghe/lvyou-panel:latest
     container_name: device-panel
     restart: unless-stopped
     ports:
