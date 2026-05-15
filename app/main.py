@@ -717,7 +717,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <select id="smsDirFilter" onchange="loadSMS()"><option value="">全部方向</option><option value="received">接收</option><option value="sent">发送</option></select>
     <button class="btn btn-p" onclick="loadSMS()">搜索</button>
   </div>
-  <div style="overflow-x:auto"><table class="tbl"><thead><tr>
+  <div class="sms-table-container"><table class="tbl sms-table"><thead><tr>
     <th>时间</th><th>设备</th><th>卡槽</th><th>方向</th><th>号码</th><th>内容</th>
   </tr></thead><tbody id="smsTableBody"></tbody></table></div>
   <div class="pg" id="smsPagination"></div>
